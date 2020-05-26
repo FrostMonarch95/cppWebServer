@@ -64,6 +64,7 @@ void http_conn::init( int sockfd, const sockaddr_in& addr )
 {
     m_sockfd = sockfd;
     m_address = addr;
+    timer = NULL;
     int error = 0;
     socklen_t len = sizeof( error );
     getsockopt( m_sockfd, SOL_SOCKET, SO_ERROR, &error, &len );

@@ -1,55 +1,48 @@
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <assert.h>
 #include <stdio.h>
+#include <signal.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
 #include <fcntl.h>
 #include <stdlib.h>
-#include <cassert>
 #include <sys/epoll.h>
-#include <signal.h>
+#include <pthread.h>
 #include "lst_timer.h"
 
-#include "locker.h"
-#include "threadpool.h"
-#include "http_conn.h"
-
+#define FD_LIMIT 65535
+#define MAX_EVENT_NUMBER 1024
 #define TIMESLOT 5
-#define MAX_FD 65536
-#define MAX_EVENT_NUMBER 10000
 
-static int pipefd[2];   //我们使用这个管道来定时调用alarm函数.
-static sort_timer_lst timer_lst;    //使用了基于升序链表的定时器.
+static int pipefd[2];
+static sort_timer_lst timer_lst;
+static int epollfd = 0;
 
-extern int addfd( int epollfd, int fd, bool one_shot );
-extern int removefd( int epollfd, int fd );
-extern int setnonblocking(int);
-void addsig( int sig, void( handler )(int), bool restart = true )
+int setnonblocking( int fd )
 {
-    struct sigaction sa;
-    memset( &sa, '\0', sizeof( sa ) );
-    sa.sa_handler = handler;
-    if( restart )
-    {
-        sa.sa_flags |= SA_RESTART;
-    }
-    sigfillset( &sa.sa_mask );
-    assert( sigaction( sig, &sa, NULL ) != -1 );
+    int old_option = fcntl( fd, F_GETFL );
+    int new_option = old_option | O_NONBLOCK;
+    fcntl( fd, F_SETFL, new_option );
+    return old_option;
 }
 
-void show_error( int connfd, const char* info )
+void addfd( int epollfd, int fd )
 {
-    printf( "%s", info );
-    send( connfd, info, strlen( info ), 0 );
-    close( connfd );
+    epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET;
+    epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
+    setnonblocking( fd );
 }
+
 void sig_handler( int sig )
 {
     int save_errno = errno;
     int msg = sig;
-    printf("sig handler sending signal %d\n",msg);
     send( pipefd[1], ( char* )&msg, 1, 0 );
     errno = save_errno;
 }
@@ -63,24 +56,21 @@ void addsig( int sig )
     sigfillset( &sa.sa_mask );
     assert( sigaction( sig, &sa, NULL ) != -1 );
 }
-void cb_func( http_conn* user_data )  //超时我们需要在这里关掉链接.
-{
-    user_data->close_conn();
-    printf( "user time out close fd \n" );
-}
+
 void timer_handler()
 {
     timer_lst.tick();
     alarm( TIMESLOT );
 }
-void addfd( int epollfd, int fd )
+
+void cb_func( client_data* user_data )
 {
-    epoll_event event;
-    event.data.fd = fd;
-    event.events = EPOLLIN | EPOLLET;
-    epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
-    setnonblocking( fd );
+    epoll_ctl( epollfd, EPOLL_CTL_DEL, user_data->sockfd, 0 );
+    assert( user_data );
+    close( user_data->sockfd );
+    printf( "close fd %d\n", user_data->sockfd );
 }
+
 int main( int argc, char* argv[] )
 {
     if( argc <= 2 )
@@ -91,27 +81,6 @@ int main( int argc, char* argv[] )
     const char* ip = argv[1];
     int port = atoi( argv[2] );
 
-    addsig( SIGPIPE, SIG_IGN );
-
-    threadpool< http_conn >* pool = NULL;
-    try
-    {
-        pool = new threadpool< http_conn >;
-    }
-    catch( ... )
-    {
-        return 1;
-    }
-
-    http_conn* users = new http_conn[ MAX_FD ];
-    assert( users );
-    int user_count = 0;
-
-    int listenfd = socket( PF_INET, SOCK_STREAM, 0 );
-    assert( listenfd >= 0 );
-    struct linger tmp = { 1, 0 };
-    setsockopt( listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof( tmp ) );
-
     int ret = 0;
     struct sockaddr_in address;
     bzero( &address, sizeof( address ) );
@@ -119,42 +88,43 @@ int main( int argc, char* argv[] )
     inet_pton( AF_INET, ip, &address.sin_addr );
     address.sin_port = htons( port );
 
+    int listenfd = socket( PF_INET, SOCK_STREAM, 0 );
+    assert( listenfd >= 0 );
+
     ret = bind( listenfd, ( struct sockaddr* )&address, sizeof( address ) );
-    assert( ret >= 0 );
+    assert( ret != -1 );
 
     ret = listen( listenfd, 5 );
-    assert( ret >= 0 );
+    assert( ret != -1 );
+
     epoll_event events[ MAX_EVENT_NUMBER ];
     int epollfd = epoll_create( 5 );
     assert( epollfd != -1 );
-    
+    addfd( epollfd, listenfd );
 
-    ret = socketpair( PF_UNIX, SOCK_STREAM, 0, pipefd );    //创建双向管道.
+    ret = socketpair( PF_UNIX, SOCK_STREAM, 0, pipefd );
     assert( ret != -1 );
     setnonblocking( pipefd[1] );
     addfd( epollfd, pipefd[0] );
-    addfd( epollfd, listenfd, false );
 
+    // add all the interesting signals here
     addsig( SIGALRM );
     addsig( SIGTERM );
-
-    //client_data* timer_users = new client_data[MAX_FD]; 
-    bool timeout = false;
     bool stop_server = false;
-    alarm( TIMESLOT );
 
-    http_conn::m_epollfd = epollfd;
+    client_data* users = new client_data[FD_LIMIT]; 
+    bool timeout = false;
+    alarm( TIMESLOT );
 
     while( !stop_server )
     {
         int number = epoll_wait( epollfd, events, MAX_EVENT_NUMBER, -1 );
-        printf("epoll we have event %d\n",number);
         if ( ( number < 0 ) && ( errno != EINTR ) )
         {
             printf( "epoll failure\n" );
             break;
         }
-
+    
         for ( int i = 0; i < number; i++ )
         {
             int sockfd = events[i].data.fd;
@@ -163,23 +133,9 @@ int main( int argc, char* argv[] )
                 struct sockaddr_in client_address;
                 socklen_t client_addrlength = sizeof( client_address );
                 int connfd = accept( listenfd, ( struct sockaddr* )&client_address, &client_addrlength );
-                if ( connfd < 0 )
-                {
-                    printf( "errno is: %d\n", errno );
-                    continue;
-                }
-                if( http_conn::m_user_count >= MAX_FD )
-                {
-                    show_error( connfd, "Internal server busy" );
-                    continue;
-                }
-                
-                users[connfd].init( connfd, client_address );
-
-                //timer_users[connfd].address = client_address;
-                //timer_users[connfd].sockfd = connfd;
-                //timer_users[connfd].connection = &users[connfd];
-
+                addfd( epollfd, connfd );
+                users[connfd].address = client_address;
+                users[connfd].sockfd = connfd;
                 util_timer* timer = new util_timer;
                 timer->user_data = &users[connfd];
                 timer->cb_func = cb_func;
@@ -188,10 +144,7 @@ int main( int argc, char* argv[] )
                 users[connfd].timer = timer;
                 timer_lst.add_timer( timer );
             }
-            else if( events[i].events & ( EPOLLRDHUP | EPOLLHUP | EPOLLERR ) )
-            {
-                users[sockfd].close_conn();
-            }else if( ( sockfd == pipefd[0] ) && ( events[i].events & EPOLLIN ) )
+            else if( ( sockfd == pipefd[0] ) && ( events[i].events & EPOLLIN ) )
             {
                 int sig;
                 char signals[1024];
@@ -199,7 +152,6 @@ int main( int argc, char* argv[] )
                 if( ret == -1 )
                 {
                     // handle the error
-                    printf("signal error\n");
                     continue;
                 }
                 else if( ret == 0 )
@@ -225,39 +177,49 @@ int main( int argc, char* argv[] )
                     }
                 }
             }
-            else if( events[i].events & EPOLLIN )
+            else if(  events[i].events & EPOLLIN )
             {
+                memset( users[sockfd].buf, '\0', BUFFER_SIZE );
+                ret = recv( sockfd, users[sockfd].buf, BUFFER_SIZE-1, 0 );
+                printf( "get %d bytes of client data %s from %d\n", ret, users[sockfd].buf, sockfd );
                 util_timer* timer = users[sockfd].timer;
-                if( users[sockfd].read() )
+                if( ret < 0 )
                 {
-                     if( timer )
+                    if( errno != EAGAIN )
+                    {
+                        cb_func( &users[sockfd] );
+                        if( timer )
+                        {
+                            timer_lst.del_timer( timer );
+                        }
+                    }
+                }
+                else if( ret == 0 )
+                {
+                    cb_func( &users[sockfd] );
+                    if( timer )
+                    {
+                        timer_lst.del_timer( timer );
+                    }
+                }
+                else
+                {
+                    //send( sockfd, users[sockfd].buf, BUFFER_SIZE-1, 0 );
+                    if( timer )
                     {
                         time_t cur = time( NULL );
                         timer->expire = cur + 3 * TIMESLOT;
                         printf( "adjust timer once\n" );
                         timer_lst.adjust_timer( timer );
                     }
-                    pool->append( users + sockfd );
-                }
-                else
-                {
-                    if( timer ) timer_lst.del_timer( timer );
-                   
-                    users[sockfd].close_conn();
                 }
             }
-            else if( events[i].events & EPOLLOUT )
+            else
             {
-                if( !users[sockfd].write() )
-                {
-                    users[sockfd].close_conn();
-                }
-            }
-            else{
-                printf("uncatch io operation \n");
-
+                // others
             }
         }
+
         if( timeout )
         {
             timer_handler();
@@ -265,11 +227,9 @@ int main( int argc, char* argv[] )
         }
     }
 
-    close( epollfd );
     close( listenfd );
-    delete [] users;
-    delete pool;
     close( pipefd[1] );
     close( pipefd[0] );
+    delete [] users;
     return 0;
 }
