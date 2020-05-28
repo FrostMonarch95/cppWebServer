@@ -73,14 +73,6 @@ void timer_handler()
     timer_lst.tick();
     alarm( TIMESLOT );
 }
-void addfd( int epollfd, int fd )
-{
-    epoll_event event;
-    event.data.fd = fd;
-    event.events = EPOLLIN | EPOLLET;
-    epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
-    setnonblocking( fd );
-}
 int main( int argc, char* argv[] )
 {
     if( argc <= 2 )
@@ -132,13 +124,11 @@ int main( int argc, char* argv[] )
     ret = socketpair( PF_UNIX, SOCK_STREAM, 0, pipefd );    //创建双向管道.
     assert( ret != -1 );
     setnonblocking( pipefd[1] );
-    addfd( epollfd, pipefd[0] );
+    addfd( epollfd, pipefd[0],false );
     addfd( epollfd, listenfd, false );
 
     addsig( SIGALRM );
     addsig( SIGTERM );
-
-    //client_data* timer_users = new client_data[MAX_FD]; 
     bool timeout = false;
     bool stop_server = false;
     alarm( TIMESLOT );
@@ -175,10 +165,6 @@ int main( int argc, char* argv[] )
                 }
                 
                 users[connfd].init( connfd, client_address );
-
-                //timer_users[connfd].address = client_address;
-                //timer_users[connfd].sockfd = connfd;
-                //timer_users[connfd].connection = &users[connfd];
 
                 util_timer* timer = new util_timer;
                 timer->user_data = &users[connfd];
