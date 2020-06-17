@@ -1,8 +1,0 @@
-20200608 09:01:06.290656Z  7096 INFO  server start pid 7096
- - main.cpp:111
-20200608 09:01:16.376789Z  7096 INFO  init http
- - http_conn.cpp:83
-20200608 09:01:16.377030Z  7096 INFO  init http
- - http_conn.cpp:83
-20200608 09:01:16.496595Z  7096 INFO  init http
- - http_conn.cpp:83
