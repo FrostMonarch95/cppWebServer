@@ -137,7 +137,7 @@ int main( int argc, char* argv[] )
     int listenfd = socket( PF_INET, SOCK_STREAM, 0 );
     assert( listenfd >= 0 );
     struct linger tmp = { 1, 0 };
-    setsockopt( listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof( tmp ) );
+    setsockopt( listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof( tmp ) );//当调用close的时候 必须等待我方发送好fin或者等待0秒.
 
     int ret = 0;
     struct sockaddr_in address;
