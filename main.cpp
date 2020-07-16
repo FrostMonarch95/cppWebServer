@@ -1,6 +1,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <bits/stdc++.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -15,6 +16,7 @@
 #include "locker.h"
 #include "threadpool.h"
 #include "http_conn.h"
+#include "ssl.h"
 
 //muduo 库
 #include "muduo/net/TcpServer.h"
@@ -40,9 +42,10 @@ using namespace muduo::net;
 
 static int pipefd[2];   //我们使用这个管道来定时调用alarm函数.
 static sort_timer_lst timer_lst;    //使用了基于升序链表的定时器.
+static std::unordered_set<int> ms;   //我们需要用这个来存储accept的sslfd
 
-extern int addfd( int epollfd, int fd, bool one_shot );
-extern int removefd( int epollfd, int fd );
+//extern int addfd( int epollfd, int fd, bool one_shot );
+//extern int removefd( int epollfd, int fd );
 extern int setnonblocking(int);
 void addsig( int sig, void( handler )(int), bool restart = true )
 {
@@ -107,6 +110,7 @@ void timer_handler()
 }
 int main( int argc, char* argv[] )
 {
+    ssl_init(); //to be finished
     setLogging(argv[0]);
     LOG_INFO<<"server start pid "<<getpid()<<'\n';
     printf("server start \n");
@@ -135,10 +139,16 @@ int main( int argc, char* argv[] )
     int user_count = 0;
 
     int listenfd = socket( PF_INET, SOCK_STREAM, 0 );
+    int sslfd=socket(PF_INET, SOCK_STREAM, 0 ); //we need ssl fd to support ssl reading
+
     assert( listenfd >= 0 );
+    assert(sslfd>=0);
+
     struct linger tmp = { 1, 0 };
     setsockopt( listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof( tmp ) );//当调用close的时候 必须等待我方发送好fin或者等待0秒.
 
+    int keepalive = 1;
+    setsockopt(listenfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive , sizeof(keepalive ));
     int ret = 0;
     struct sockaddr_in address;
     bzero( &address, sizeof( address ) );
@@ -149,8 +159,21 @@ int main( int argc, char* argv[] )
     ret = bind( listenfd, ( struct sockaddr* )&address, sizeof( address ) );
     assert( ret >= 0 );
 
+    ///////////////SSL port binding
+    bzero( &address, sizeof( address ) );
+    address.sin_family = AF_INET;
+    inet_pton( AF_INET, ip, &address.sin_addr );
+    address.sin_port = htons( port+1 ); //SSL port equals to http port + 1
+    ret=bind(sslfd,( struct sockaddr* )&address, sizeof( address ) );
+    assert( ret >= 0 );
+    ///////////////
+
     ret = listen( listenfd, 5 );
     assert( ret >= 0 );
+    ret = listen( sslfd, 5 );
+    assert( ret >= 0 );
+
+
     epoll_event events[ MAX_EVENT_NUMBER ];
     int epollfd = epoll_create( 5 );
     assert( epollfd != -1 );
@@ -158,8 +181,9 @@ int main( int argc, char* argv[] )
     ret = socketpair( PF_UNIX, SOCK_STREAM, 0, pipefd );    //创建双向管道.
     assert( ret != -1 );
     setnonblocking( pipefd[1] );
-    addfd( epollfd, pipefd[0],false );
-    addfd( epollfd, listenfd, false );
+    addfd( epollfd, pipefd[0],false ,true);
+    addfd( epollfd, listenfd, false ,true);
+    addfd(epollfd,sslfd,false,true);
 
     addsig( SIGALRM );
     addsig( SIGTERM );
@@ -182,11 +206,27 @@ int main( int argc, char* argv[] )
         for ( int i = 0; i < number; i++ )
         {
             int sockfd = events[i].data.fd;
-            if( sockfd == listenfd )
+            if(sockfd == sslfd){    //sslfd receive message
+                struct sockaddr_in client_address;
+                socklen_t client_addrlength = sizeof( client_address );
+                int connfd = accept( sockfd, ( struct sockaddr* )&client_address, &client_addrlength );
+                if ( connfd < 0 )
+                {
+                    printf( "errno is: %d\n", errno );
+                    continue;
+                }
+                assert(!ms.count(connfd));  
+                ms.insert(connfd);
+                printf("epoll fd is %d,connfd is %d\n",epollfd,connfd);
+                ssl_prepare_to_write(epollfd,connfd);   //... to be finished
+
+            }else if( sockfd == listenfd )
             {
                 struct sockaddr_in client_address;
                 socklen_t client_addrlength = sizeof( client_address );
                 int connfd = accept( listenfd, ( struct sockaddr* )&client_address, &client_addrlength );
+                
+                printf("accepting new fd %d\n",connfd);
                 if ( connfd < 0 )
                 {
                     printf( "errno is: %d\n", errno );
@@ -210,7 +250,11 @@ int main( int argc, char* argv[] )
             }
             else if( events[i].events & ( EPOLLRDHUP | EPOLLHUP | EPOLLERR ) )
             {
-                users[sockfd].close_conn();
+                if(ms.count(sockfd)){
+                    printf("error epoll\n");
+                    ms.erase(sockfd);
+                    ssl_close_client(sockfd); //... to be finished
+                }else users[sockfd].close_conn();
             }else if( ( sockfd == pipefd[0] ) && ( events[i].events & EPOLLIN ) )
             {
                 int sig;
@@ -247,6 +291,8 @@ int main( int argc, char* argv[] )
             }
             else if( events[i].events & EPOLLIN )
             {
+                if(ms.count(sockfd))continue;   //sslfd we just dont care those input
+
                 util_timer* timer = users[sockfd].timer;
                 if( users[sockfd].read() )
                 {
@@ -268,7 +314,12 @@ int main( int argc, char* argv[] )
             }
             else if( events[i].events & EPOLLOUT )
             {
-                if( !users[sockfd].write() )
+                if(ms.count(sockfd)){
+                    ssl_write(sockfd);  //to be finished we need to write message to the client for ssl
+                    ssl_close_client(sockfd);  //
+                    ms.erase(sockfd);   
+                }
+                else if( !users[sockfd].write() )   //common http 
                 {
                     users[sockfd].close_conn();
                 }
@@ -284,7 +335,7 @@ int main( int argc, char* argv[] )
             timeout = false;
         }
     }
-
+    ssl_out();  //to be finished
     close( epollfd );
     close( listenfd );
     delete [] users;

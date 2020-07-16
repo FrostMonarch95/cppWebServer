@@ -21,7 +21,7 @@ int setnonblocking( int fd )
     return old_option;
 }
 
-void addfd( int epollfd, int fd, bool one_shot )
+void addfd( int epollfd, int fd, bool one_shot,bool non_blocking )
 {
     epoll_event event;
     event.data.fd = fd;
@@ -31,6 +31,7 @@ void addfd( int epollfd, int fd, bool one_shot )
         event.events |= EPOLLONESHOT;
     }
     epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
+    if(non_blocking)
     setnonblocking( fd );
 }
 
@@ -45,7 +46,8 @@ void modfd( int epollfd, int fd, int ev )
     epoll_event event;
     event.data.fd = fd;
     event.events = ev | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;
-    epoll_ctl( epollfd, EPOLL_CTL_MOD, fd, &event );
+    if(epoll_ctl( epollfd, EPOLL_CTL_MOD, fd, &event )<0)
+        printf("epoll ctl error %d\n",errno);
 }
 
 int http_conn::m_user_count = 0;
@@ -72,7 +74,7 @@ void http_conn::init( int sockfd, const sockaddr_in& addr )
     getsockopt( m_sockfd, SOL_SOCKET, SO_ERROR, &error, &len );
     int reuse = 1;
     setsockopt( m_sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof( reuse ) );
-    addfd( m_epollfd, sockfd, true );
+    addfd( m_epollfd, sockfd, true ,true);
     m_user_count++;
 
     init();
@@ -179,7 +181,8 @@ http_conn::HTTP_CODE http_conn::parse_request_line( char* text )
     }
     else
     {
-        return BAD_REQUEST;
+        if(strcasecmp(method,"HEAD") ==0)m_method=HEAD; //支持head请求
+        else return BAD_REQUEST;
     }
 
     m_url += strspn( m_url, " \t" );
@@ -515,9 +518,11 @@ bool http_conn::process_write( HTTP_CODE ret )
             add_status_line( 200, ok_200_title );
             if ( m_file_stat.st_size != 0 )
             {
-                add_headers( m_file_stat.st_size );
                 m_iv[ 0 ].iov_base = m_write_buf;
+                add_headers( m_file_stat.st_size );
                 m_iv[ 0 ].iov_len = m_write_idx;
+                if(m_method==HEAD)return true;  //当我们不需要传输文件时 需要在这里返回
+
                 m_iv[ 1 ].iov_base = m_file_address;
                 m_iv[ 1 ].iov_len = m_file_stat.st_size;
                 m_iv_count = 2;

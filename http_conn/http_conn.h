@@ -94,5 +94,7 @@ private:
     struct iovec m_iv[2];
     int m_iv_count;
 };
-
+void modfd( int , int , int  );
+void removefd(int ,int);
+void addfd(int ,int ,bool,bool);
 #endif

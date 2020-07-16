@@ -126,7 +126,6 @@ public:
         {
             return;
         }
-        printf( "timer tick\n" );
         time_t cur = time( NULL );
         util_timer* tmp = head;
         while( tmp )
