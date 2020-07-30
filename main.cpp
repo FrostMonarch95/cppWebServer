@@ -114,6 +114,7 @@ int main( int argc, char* argv[] )
     setLogging(argv[0]);
     LOG_INFO<<"server start pid "<<getpid()<<'\n';
     printf("server start \n");
+    
     if( argc <= 2 )
     {
         printf( "usage: %s ip_address port_number\n", basename( argv[0] ) );
@@ -250,6 +251,7 @@ int main( int argc, char* argv[] )
             }
             else if( events[i].events & ( EPOLLRDHUP | EPOLLHUP | EPOLLERR ) )
             {
+                printf("maybe client close the server\n");
                 if(ms.count(sockfd)){
                     printf("error epoll\n");
                     ms.erase(sockfd);

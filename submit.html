@@ -1,0 +1,29 @@
+<form class="upload">
+   <input type="file" name="uploadFile" accept=".cpp" required />
+   <br/><br/>
+   <input type="submit" />
+</form>
+<script>
+const uploadForm = document.querySelector('.upload')
+uploadForm.addEventListener('submit', function(e) {
+   e.preventDefault()
+   let file = e.target.uploadFile.files[0]
+   let formData = new FormData()
+   formData.append('file', file)
+   fetch('http://localhost:8000', {
+      method: 'POST',
+      body: formData
+   })
+   .then(resp => resp.json())
+   .then(data => {
+      if (data.errors) {
+         alert(data.errors)
+      }
+      else {
+         console.log(data)
+      }
+   })
+})
+
+
+</script>
